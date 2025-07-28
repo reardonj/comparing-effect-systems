@@ -8,6 +8,7 @@ import fs2.Stream
 
 import sttp.model.Uri
 import fs2.concurrent.Channel
+import cats.effect.std.Semaphore
 
 final class CatsScraperHighLevel(
     fetch: Fetch[IO],
@@ -19,28 +20,26 @@ final class CatsScraperHighLevel(
 ):
 
   def start: IO[Unit] =
-    (Channel.unbounded[IO, Scrape], Ref.of[IO, Set[Uri]](Set.empty)).flatMapN { case (channel, visited) =>
-      def enqueue(target: Scrape): IO[Int] =
-        if target.depth >= maxDepth then IO.pure(0)
+    (Semaphore[IO](parallelism), Ref.of[IO, Set[Uri]](Set.empty)).flatMapN { case (semaphore, visited) =>
+      def enqueue(target: Scrape): IO[Unit] =
+        if target.depth >= maxDepth then IO.unit
         else
           visited
-            .getAndUpdate(_ + target.uri)
-            .flatMap(visitedBefore => if visitedBefore.contains(target.uri) then IO.pure(0) else channel.send(target) >> IO.pure(1))
+            .getAndUpdate(visited => visited + target.uri)
+            .flatMap(visitedBefore => IO.whenA(!visitedBefore.contains(target.uri))(crawl(target.uri, target.depth)))
 
-      def crawl(uri: Uri, depth: Int): IO[Int] =
-        for
-          content <- fetch.fetch(uri)
-          (links, markdown) <- IO.fromEither(MdConverter.convertAndExtractLinks(content, uri, selector))
-          pushFrontier = links.map(Scrape(_, depth + 1)).foldMapM(enqueue)
-          persist = store.store(Names.toFilename(uri, root), markdown)
-          enqueued <- persist.parProductR(pushFrontier)
-        yield enqueued
+      def crawl(uri: Uri, depth: Int): IO[Unit] =
+        semaphore.permit
+          .use { _ =>
+            for
+              content <- fetch.fetch(uri)
+              (links, markdown) <- IO.fromEither(MdConverter.convertAndExtractLinks(content, uri, selector))
+              pushFrontier = links.map(Scrape(_, depth + 1)).parTraverse_(enqueue(_))
+              persist = store.store(Names.toFilename(uri, root), markdown)
+            yield persist.parProductR(pushFrontier)
+          }
+          .flatten
+          .void
 
-      enqueue(Scrape(root, 0)) >>
-        channel.stream
-          .parEvalMap(maxConcurrent = parallelism) { case Scrape(uri, depth) => crawl(uri, depth) }
-          .scan(1) { (inFlight, enqueued) => inFlight + enqueued - 1 }
-          .takeWhile(_ > 0)
-          .compile
-          .drain
+      enqueue(Scrape(root, 0))
     }
