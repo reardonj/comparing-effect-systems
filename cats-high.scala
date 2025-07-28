@@ -27,19 +27,20 @@ final class CatsScraperHighLevel(
             .getAndUpdate(_ + target.uri)
             .flatMap(visitedBefore => if visitedBefore.contains(target.uri) then IO.pure(0) else channel.send(target) >> IO.pure(1))
 
+      def crawl(uri: Uri, depth: Int): IO[Int] =
+        for
+          content <- fetch.fetch(uri)
+          (links, markdown) <- IO.fromEither(MdConverter.convertAndExtractLinks(content, uri, selector))
+          pushFrontier = links.map(Scrape(_, depth + 1)).foldMapM(enqueue)
+          persist = store.store(Names.toFilename(uri, root), markdown)
+          enqueued <- persist.parProductR(pushFrontier)
+        yield enqueued
+
       enqueue(Scrape(root, 0)) >>
         channel.stream
           .parEvalMap(maxConcurrent = parallelism) { case Scrape(uri, depth) => crawl(uri, depth) }
-          .evalMap(_.foldMapM(enqueue).map(_ - 1))
-          .scan(1) { _ + _ }
+          .scan(1) { _ + _ - 1 }
           .takeWhile(_ > 0)
           .compile
           .drain
     }
-
-  private def crawl(uri: Uri, depth: Int): IO[Vector[Scrape]] =
-    for
-      content <- fetch.fetch(uri)
-      (links, markdown) <- IO.fromEither(MdConverter.convertAndExtractLinks(content, uri, selector))
-      _ <- store.store(Names.toFilename(uri, root), markdown)
-    yield links.map(Scrape(_, depth + 1))
