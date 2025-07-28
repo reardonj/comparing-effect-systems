@@ -19,6 +19,7 @@
 // effect / direct-style dependencies
 
 //> using dep org.typelevel::cats-effect:3.6.2
+//> using dep co.fs2::fs2-core:3.12.0
 
 //> using dep dev.zio::zio:2.1.19
 

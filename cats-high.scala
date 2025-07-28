@@ -3,7 +3,11 @@ package ma.chinespirit.crawldown
 import cats.effect.{IO, Ref}
 import cats.effect.std.Queue
 import cats.syntax.all.*
+
+import fs2.Stream
+
 import sttp.model.Uri
+import fs2.concurrent.Channel
 
 final class CatsScraperHighLevel(
     fetch: Fetch[IO],
@@ -15,38 +19,26 @@ final class CatsScraperHighLevel(
 ):
 
   def start: IO[Unit] =
-    for
-      queue <- Queue.unbounded[IO, Scrape | Done]
-      visited <- Ref.of[IO, Set[Uri]](Set.empty)
-      inFlight <- Ref.of[IO, Int](0)
-      _ <- inFlight.update(_ + 1)
-      _ <- queue.offer(Scrape(root, 0))
-      _ <- IO.parSequenceN_(parallelism)(Vector.fill(parallelism)(worker(queue, visited, inFlight)))
-    yield ()
+    (Channel.unbounded[IO, Scrape], Ref.of[IO, Set[Uri]](Set.empty), Ref.of[IO, Int](1)).flatMapN { case (channel, visited, inFlight) =>
+      def enqueue(target: Scrape): IO[Int] =
+        if target.depth >= maxDepth then IO.pure(0)
+        else
+          visited
+            .getAndUpdate(_ + target.uri)
+            .flatMap(visitedBefore => if visitedBefore.contains(target.uri) then IO.pure(0) else channel.send(target) >> IO.pure(1))
 
-  private def worker(queue: Queue[IO, Scrape | Done], visited: Ref[IO, Set[Uri]], inFlight: Ref[IO, Int]): IO[Unit] =
-    queue.take.flatMap {
-      case Done => IO.unit
-      case Scrape(uri, depth) =>
-        val handleUri =
-          if depth >= maxDepth then IO.unit
-          else
-            visited.getAndUpdate(_ + uri).flatMap { visitedSet =>
-              if visitedSet.contains(uri) then IO.unit
-              else crawl(uri, depth, queue, inFlight)
-            }
-
-        handleUri *> inFlight.updateAndGet(_ - 1).flatMap { currentInFlight =>
-          if currentInFlight > 0 then worker(queue, visited, inFlight)
-          else Vector.fill(parallelism)(Done).map(queue.offer).sequence.void
-        }
+      enqueue(Scrape(root, 0)) >>
+        channel.stream
+          .parEvalMap(maxConcurrent = parallelism) { case Scrape(uri, depth) => crawl(uri, depth) }
+          .evalMap(_.foldMapM(enqueue).flatMap(enqueued => inFlight.updateAndGet(_ - 1 + enqueued)))
+          .takeWhile(_ > 0)
+          .compile
+          .drain
     }
 
-  private def crawl(uri: Uri, depth: Int, queue: Queue[IO, Scrape | Done], inFlight: Ref[IO, Int]): IO[Unit] =
+  private def crawl(uri: Uri, depth: Int): IO[Vector[Scrape]] =
     for
       content <- fetch.fetch(uri)
       (links, markdown) <- IO.fromEither(MdConverter.convertAndExtractLinks(content, uri, selector))
-      pushFrontier = links.traverse_(uri => inFlight.updateAndGet(_ + 1) *> queue.offer(Scrape(uri, depth + 1)))
-      persist = store.store(Names.toFilename(uri, root), markdown)
-      _ <- (pushFrontier, persist).parTupled
-    yield ()
+      _ <- store.store(Names.toFilename(uri, root), markdown)
+    yield links.map(Scrape(_, depth + 1))
