@@ -39,7 +39,7 @@ final class CatsScraperHighLevel(
       enqueue(Scrape(root, 0)) >>
         channel.stream
           .parEvalMap(maxConcurrent = parallelism) { case Scrape(uri, depth) => crawl(uri, depth) }
-          .scan(1) { _ + _ - 1 }
+          .scan(1) { (inFlight, enqueued) => inFlight + enqueued - 1 }
           .takeWhile(_ > 0)
           .compile
           .drain
