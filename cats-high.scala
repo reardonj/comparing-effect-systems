@@ -19,7 +19,7 @@ final class CatsScraperHighLevel(
 ):
 
   def start: IO[Unit] =
-    (Channel.unbounded[IO, Scrape], Ref.of[IO, Set[Uri]](Set.empty), Ref.of[IO, Int](1)).flatMapN { case (channel, visited, inFlight) =>
+    (Channel.unbounded[IO, Scrape], Ref.of[IO, Set[Uri]](Set.empty)).flatMapN { case (channel, visited) =>
       def enqueue(target: Scrape): IO[Int] =
         if target.depth >= maxDepth then IO.pure(0)
         else
@@ -30,7 +30,8 @@ final class CatsScraperHighLevel(
       enqueue(Scrape(root, 0)) >>
         channel.stream
           .parEvalMap(maxConcurrent = parallelism) { case Scrape(uri, depth) => crawl(uri, depth) }
-          .evalMap(_.foldMapM(enqueue).flatMap(enqueued => inFlight.updateAndGet(_ - 1 + enqueued)))
+          .evalMap(_.foldMapM(enqueue).map(_ - 1))
+          .scan(1) { _ + _ }
           .takeWhile(_ > 0)
           .compile
           .drain
